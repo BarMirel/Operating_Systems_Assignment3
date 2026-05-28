@@ -601,20 +601,36 @@ gpu_swap_backing_locked(struct virtio_gpu_mem_entry *entries, int n)
     gpu_send_locked(&flush, sizeof(flush));
 }
 
+// ── Copy the current user-backed framebuffer into the kernel framebuffer.
+// This is used when the user process that owns the flipped backing exits,
+// so the display can be restored without reverting to stale kernel contents.
+static void
+copy_user_fb(pagetable_t pt, uint64 va)
+{
+    for (int i = 0; i < FB_PAGES; i++) {
+        uint64 pa = walkaddr(pt, va + i * PGSIZE);
+        if (pa == 0)
+            continue;
+        void *src = (void *)pa;
+        memmove(fb[i], src, PGSIZE);
+    }
+}
+
 // ── Public: restore GPU backing to the kernel framebuffer ────────────
 // Called when a process that flipped the display exits, so the GPU is
 // not left pointing at freed user pages.
 void
 virtio_gpu_restore(pagetable_t pt, uint64 va)
 {
-    (void)pt; (void)va;
+    acquire(&gpu_lock);
+    copy_user_fb(pt, va);
+
     static struct virtio_gpu_mem_entry entries[FB_PAGES];
     for (int i = 0; i < FB_PAGES; i++) {
         entries[i].addr    = (uint64)fb[i];
         entries[i].length  = PGSIZE;
         entries[i].padding = 0;
     }
-    acquire(&gpu_lock);
     gpu_swap_backing_locked(entries, FB_PAGES);
     release(&gpu_lock);
 }
