@@ -146,6 +146,10 @@ found:
   p->context.ra = (uint64)forkret;
   p->context.sp = p->kstack + PGSIZE;
 
+  p->display_map_va = 0;
+  p->display_flip_active = 0;
+  p->display_flip_va = 0;
+
   return p;
 }
 
@@ -158,9 +162,17 @@ freeproc(struct proc *p)
   if(p->trapframe)
     kfree((void*)p->trapframe);
   p->trapframe = 0;
-  if(p->pagetable)
+  if(p->display_flip_active)
+    virtio_gpu_restore(p->pagetable, p->display_flip_va);
+  if(p->pagetable) {
+    if(p->display_map_va != 0)
+      uvmunmap(p->pagetable, p->display_map_va, GPU_FB_PAGES, 0);
     proc_freepagetable(p->pagetable, p->sz);
+  }
   p->pagetable = 0;
+  p->display_map_va = 0;
+  p->display_flip_active = 0;
+  p->display_flip_va = 0;
   p->sz = 0;
   p->pid = 0;
   p->parent = 0;

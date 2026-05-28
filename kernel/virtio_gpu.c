@@ -374,12 +374,10 @@ draw_char(int cx, int cy, unsigned char ch)
 
 // ── Command submission (polling, no interrupts) ───────────────────────
 
-// Submit a 2-descriptor command (request + shared response) and block
-// until the device completes it by advancing the used ring.
+// Core submit: caller must hold gpu_lock.
 static void
-gpu_send(void *req, int req_len)
+gpu_send_locked(void *req, int req_len)
 {
-    acquire(&gpu_lock);
     int d0 = alloc_desc();
     int d1 = alloc_desc();
 
@@ -413,6 +411,15 @@ gpu_send(void *req, int req_len)
 
     free_desc(d0);
     free_desc(d1);
+}
+
+// Submit a 2-descriptor command (request + shared response) and block
+// until the device completes it by advancing the used ring.
+static void
+gpu_send(void *req, int req_len)
+{
+    acquire(&gpu_lock);
+    gpu_send_locked(req, req_len);
     release(&gpu_lock);
 }
 
@@ -546,6 +553,89 @@ void virtio_gpu_init(void)
 void virtio_gpu_commit(void)
 {
     gpu_transfer_flush();
+}
+
+// ── Public: return physical address of kernel framebuffer page i ─────
+uint64
+virtio_gpu_fb_pa(int i)
+{
+    return (uint64)fb[i];
+}
+
+// Build prepared command structs in-place under gpu_lock, then submit
+// DETACH + ATTACH + TRANSFER + FLUSH as one atomic sequence so the daemon
+// (or another flipper) cannot observe a detached-but-not-yet-attached state.
+static void
+gpu_swap_backing_locked(struct virtio_gpu_mem_entry *entries, int n)
+{
+    // DETACH current backing.
+    static struct virtio_gpu_resource_detach_backing detach;
+    memset(&detach, 0, sizeof(detach));
+    detach.hdr.type = VIRTIO_GPU_CMD_RESOURCE_DETACH_BACKING;
+    detach.resource_id = RESOURCE_ID;
+    gpu_send_locked(&detach, sizeof(detach));
+
+    // ATTACH new backing.
+    attach_buf.backing.hdr.type = VIRTIO_GPU_CMD_RESOURCE_ATTACH_BACKING;
+    attach_buf.backing.resource_id = RESOURCE_ID;
+    attach_buf.backing.nr_entries = n;
+    for (int i = 0; i < n; i++)
+        attach_buf.entries[i] = entries[i];
+    gpu_send_locked(&attach_buf, sizeof(attach_buf));
+
+    // Commit the new backing to the display.
+    static struct virtio_gpu_transfer_to_host_2d xfer;
+    memset(&xfer, 0, sizeof(xfer));
+    xfer.hdr.type = VIRTIO_GPU_CMD_TRANSFER_TO_HOST_2D;
+    xfer.r.width = SCREEN_W;
+    xfer.r.height = SCREEN_H;
+    xfer.resource_id = RESOURCE_ID;
+    gpu_send_locked(&xfer, sizeof(xfer));
+
+    static struct virtio_gpu_resource_flush flush;
+    memset(&flush, 0, sizeof(flush));
+    flush.hdr.type = VIRTIO_GPU_CMD_RESOURCE_FLUSH;
+    flush.r.width = SCREEN_W;
+    flush.r.height = SCREEN_H;
+    flush.resource_id = RESOURCE_ID;
+    gpu_send_locked(&flush, sizeof(flush));
+}
+
+// ── Public: restore GPU backing to the kernel framebuffer ────────────
+// Called when a process that flipped the display exits, so the GPU is
+// not left pointing at freed user pages.
+void
+virtio_gpu_restore(pagetable_t pt, uint64 va)
+{
+    (void)pt; (void)va;
+    static struct virtio_gpu_mem_entry entries[FB_PAGES];
+    for (int i = 0; i < FB_PAGES; i++) {
+        entries[i].addr    = (uint64)fb[i];
+        entries[i].length  = PGSIZE;
+        entries[i].padding = 0;
+    }
+    acquire(&gpu_lock);
+    gpu_swap_backing_locked(entries, FB_PAGES);
+    release(&gpu_lock);
+}
+
+// ── Public: zero-copy page flip ───────────────────────────────────────
+// Re-points the GPU's backing list to the user buffer starting at virtual
+// address va in page table pt.  Walks the page table page-by-page to
+// collect physical addresses (the GPU needs physical, not virtual).
+void
+virtio_gpu_flip(pagetable_t pt, uint64 va)
+{
+    // Static to avoid overflowing the kernel stack (FB_PAGES*16 = 4800 bytes).
+    static struct virtio_gpu_mem_entry entries[FB_PAGES];
+    for (int i = 0; i < FB_PAGES; i++) {
+        entries[i].addr    = walkaddr(pt, va + i * PGSIZE);
+        entries[i].length  = PGSIZE;
+        entries[i].padding = 0;
+    }
+    acquire(&gpu_lock);
+    gpu_swap_backing_locked(entries, FB_PAGES);
+    release(&gpu_lock);
 }
 
 // ── GPU daemon ────────────────────────────────────────────────────────
